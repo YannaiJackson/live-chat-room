@@ -1,47 +1,79 @@
-import asyncio
-import websockets
-import json
+from fastapi import FastAPI, HTTPException
 import pika
+import json
+import logging
+import os
+import uvicorn
 
-HOST = "localhost"
-PORT = 8765  # WebSocket Port
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# FastAPI app
+app = FastAPI()
+
+# RabbitMQ configuration
 RABBITMQ_HOST = "localhost"
+QUEUE_NAME = "auth_queue"
 
-# Maintain active user connections
-active_users = {}
+# File to store registered usernames
+USER_FILE = "users.txt"
+
+# Ensure the file exists
+if not os.path.exists(USER_FILE):
+    with open(USER_FILE, "w") as f:
+        pass  # Create an empty file
 
 
-async def handle_connection(websocket, path):
-    """Handle user authentication and notify Chat Service."""
+def get_rabbitmq_channel():
+    """Connects to RabbitMQ and returns a channel."""
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+    channel = connection.channel()
+    channel.queue_declare(queue=QUEUE_NAME, durable=True)  # Ensure queue exists
+    return connection, channel
+
+
+def is_username_unique(username: str) -> bool:
+    """Checks if the username is unique by reading from users.txt."""
+    with open(USER_FILE, "r") as f:
+        existing_users = {line.strip() for line in f.readlines()}
+    return username not in existing_users
+
+
+def store_username(username: str):
+    """Writes a new unique username to users.txt."""
+    with open(USER_FILE, "a") as f:
+        f.write(username + "\n")
+
+
+@app.post("/auth")
+def authenticate_user(payload: dict):
+    username = payload.get("username", "").strip()
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid username")
+
+    # Check if the username is unique
+    if not is_username_unique(username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+
     try:
-        # Receive authentication request
-        data = await websocket.recv()
-        request = json.loads(data)
-        username = request.get("username")
+        # Store username in file
+        store_username(username)
 
-        if not username or username in active_users:
-            await websocket.send(json.dumps({"status": "error", "message": "Username taken"}))
-            return
-
-        active_users[username] = websocket
-        await websocket.send(json.dumps({"status": "ok", "message": f"Welcome, {username}!"}))
-
-        # Notify Chat Service via RabbitMQ
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
-        channel = connection.channel()
-        channel.queue_declare(queue="auth_notifications")
-        channel.basic_publish(exchange="", routing_key="auth_notifications", body=json.dumps({"username": username}))
+        # Send username to RabbitMQ
+        connection, channel = get_rabbitmq_channel()
+        message = json.dumps({"username": username})
+        channel.basic_publish(exchange="", routing_key=QUEUE_NAME, body=message)
         connection.close()
 
-        # Keep connection open
-        await websocket.wait_closed()
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if username in active_users:
-            del active_users[username]
+        logger.info(f"Username '{username}' registered and sent to RabbitMQ")
+        return {"message": "User registered successfully"}
 
-# Start WebSocket Server
-start_server = websockets.serve(handle_connection, HOST, PORT)
-asyncio.get_event_loop().run_until_complete(start_server)
-asyncio.get_event_loop().run_forever()
+    except Exception as e:
+        logger.error(f"Error handling username '{username}': {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+if __name__ == '__main__':
+    uvicorn.run("auth_service:app", host="127.0.0.1", port=8000, reload=True)

@@ -1,0 +1,2 @@
+{"room": "global", "username": "Eric", "message": "hi"}
+{"room": "global", "username": "Eric", "message": "hiiiii"}
