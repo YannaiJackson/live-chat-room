@@ -1,0 +1,58 @@
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__
+*.pdb
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# VSCode
+.vscode/
+
+# Pytest
+.cache/
+
+# MyPy
+.mypy_cache/
+
+# Build directories
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Packaging
+*.tar.gz
+*.zip
+*.whl
+
+# IDEs
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Docker
+*.dockerfile
+docker-compose.override.yml
+
+# Logs
+*.log
+*.log.*
+
+# Database files
+*.sqlite3
+*.db
+
+# Environment variables
+.env
+*.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
