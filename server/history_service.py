@@ -1,72 +1,102 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 import os
-import uvicorn
+import asyncio
+import aioredis
+import redis
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 app = FastAPI()
 
+# Path to store chat history files
 CHAT_HISTORY_DIR = "chat_history"
 os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 
-
-# Store active WebSocket connections
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, list[WebSocket]] = {}
-
-    async def connect(self, room: str, websocket: WebSocket):
-        await websocket.accept()
-        if room not in self.active_connections:
-            self.active_connections[room] = []
-        self.active_connections[room].append(websocket)
-
-    def disconnect(self, room: str, websocket: WebSocket):
-        self.active_connections[room].remove(websocket)
-        if not self.active_connections[room]:
-            del self.active_connections[room]
-
-    async def broadcast(self, room: str, message: str):
-        if room in self.active_connections:
-            for connection in self.active_connections[room]:
-                await connection.send_text(message)
+# Connect to Redis (Local Docker)
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
-manager = ConnectionManager()
+# Async Redis connection for WebSocket Pub/Sub
+async def get_redis():
+    return await aioredis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True)
+
+
+# WebSocket connections per room
+active_connections = {}
+
+
+# ====== REST API ======
+class ChatRoom(BaseModel):
+    chat_room: str
 
 
 @app.get("/chat-history")
-async def get_chat_history(chat_room: str = Query(..., alias="chat-room")):
+def get_chat_history(chat_room: str):
+    """Returns chat history of a specified chat-room from a file."""
     file_path = os.path.join(CHAT_HISTORY_DIR, f"{chat_room}.txt")
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Chat history not found")
-    with open(file_path, "r", encoding="utf-8") as file:
-        return {"chat_room": chat_room, "history": file.readlines()}
+        return {"message": "No history found"}
+
+    with open(file_path, "r") as f:
+        history = f.readlines()
+
+    return {"chat_room": chat_room, "history": history}
 
 
 @app.post("/chat-history")
-async def create_chat_history(chat_room: str = Query(..., alias="chat-room")):
+def create_chat_room(chat_room: str):
+    """Creates a new file to store chat history for a chat-room."""
     file_path = os.path.join(CHAT_HISTORY_DIR, f"{chat_room}.txt")
     if os.path.exists(file_path):
-        raise HTTPException(status_code=400, detail="Chat room already exists")
-    with open(file_path, "w", encoding="utf-8") as file:
-        file.write("")
-    return {"message": f"Chat room '{chat_room}' created successfully"}
+        return {"message": "Chat room already exists"}
+
+    open(file_path, "w").close()
+    return {"message": f"Chat room '{chat_room}' created"}
 
 
+# ====== WebSocket Communication ======
 @app.websocket("/ws/{chat_room}")
-async def websocket_endpoint(chat_room: str, websocket: WebSocket):
-    await manager.connect(chat_room, websocket)
-    file_path = os.path.join(CHAT_HISTORY_DIR, f"{chat_room}.txt")
-    if not os.path.exists(file_path):
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write("")
+async def websocket_endpoint(websocket: WebSocket, chat_room: str):
+    """Handles WebSocket connections and broadcasts messages using Redis."""
+    await websocket.accept()
+
+    # Store connection
+    if chat_room not in active_connections:
+        active_connections[chat_room] = []
+    active_connections[chat_room].append(websocket)
+
+    # Redis Subscription Task
+    redis = await get_redis()
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(chat_room)
+
+    async def listen_to_redis():
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                await websocket.send_text(message["data"])
+
+    redis_task = asyncio.create_task(listen_to_redis())
+
     try:
         while True:
-            message = await websocket.receive_text()
-            with open(file_path, "a", encoding="utf-8") as file:
-                file.write(message + "\n")
-            await manager.broadcast(chat_room, message)
+            data = await websocket.receive_text()
+
+            # Save to file
+            file_path = os.path.join(CHAT_HISTORY_DIR, f"{chat_room}.txt")
+            with open(file_path, "a") as f:
+                f.write(data + "\n")
+
+            # Publish to Redis (other pods will receive it)
+            redis_client.publish(chat_room, data)
+
     except WebSocketDisconnect:
-        manager.disconnect(chat_room, websocket)
+        active_connections[chat_room].remove(websocket)
+        await pubsub.unsubscribe(chat_room)
+        redis_task.cancel()
+
 
 if __name__ == "__main__":
-    uvicorn.run("history_service:app", host="127.0.0.1", port=5000, reload=True)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=5000)
