@@ -1,101 +1,124 @@
-import json
-import requests
 import asyncio
 import websockets
+import json
+import aiohttp
 
 SERVER_URL = "http://localhost:5000"
 
 
-async def receive_messages(ws):
-    """Continuously receive and display messages from the WebSocket."""
+def print_menu():
+    print("\nOptions:")
+    print("1. Create chat room -> {\"username\": \"your_name\", \"create\": \"chat_room_name\"}")
+    print("2. Join chat room -> {\"username\": \"your_name\", \"join\": \"chat_room_name\"}")
+    print("3. Send message -> {\"username\": \"your_name\", \"message\": \"your_message\"}")
+
+
+async def create_room(session, command):
+    """Sends a request to create a chat room."""
+    endpoint = "/create-chat-room"
+    payload = {
+        "username": command["username"],
+        "chat_room_name": command["create"]
+    }
+    async with session.post(SERVER_URL + endpoint, json=payload) as response:
+        if response.status == 200:
+            data = await response.json()
+            print(f"\nCreated chat room: {data['chat_room']}")
+            return data.get("websocket_url")
+        else:
+            print(f"Error: {await response.text()}")
+            return None
+
+
+async def join_room(session, command):
+    """Sends a request to join a chat room and returns the WebSocket URL."""
+    endpoint = "/join-chat-room"
+    payload = {
+        "username": command["username"],
+        "chat_room_name": command["join"]
+    }
+    async with session.post(SERVER_URL + endpoint, json=payload) as response:
+        if response.status == 200:
+            data = await response.json()
+            print(f"\nJoined chat room: {data['chat_room']}")
+            print("\nChat History:")
+            for msg in data["history"]:
+                print(msg)
+            return data.get("websocket_url")
+        else:
+            print(f"Error: {await response.text()}")
+            return None
+
+
+async def send_message(websocket, username):
+    """Handles sending messages via WebSocket."""
+    while True:
+        try:
+            user_input = input("Enter JSON command: ")
+            if user_input.lower() == "exit":
+                print("Exiting chat...")
+                break
+
+            try:
+                command = json.loads(user_input)
+            except json.JSONDecodeError:
+                print("Invalid JSON format. Try again.")
+                continue
+
+            if "message" in command:
+                message_data = {
+                    "username": command.get("username", username),
+                    "message": command["message"]
+                }
+                await websocket.send(json.dumps(message_data))
+            else:
+                print("Invalid command format. Use {\"username\": \"your_name\", \"message\": \"text\"}")
+        except Exception as e:
+            print(f"Error sending message: {e}")
+            break
+
+
+async def receive_messages(websocket):
+    """Handles receiving messages from WebSocket."""
     try:
-        while True:
-            message = await ws.recv()
-            print(f"\n[New Message] {message}")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
+        async for message in websocket:
+            print(f"\n{message}")
+    except websockets.exceptions.ConnectionClosed:
+        print("Connection closed.")
+
+
+async def handle_chat(websocket_url, username):
+    """Handles WebSocket connection for chatting."""
+    async with websockets.connect(websocket_url) as websocket:
+        print("Connected to chat room. Start sending messages!")
+        await asyncio.gather(
+            send_message(websocket, username),
+            receive_messages(websocket)
+        )
 
 
 async def main():
-    current_websocket = None  # We'll store the active connection here
-
-    while True:
-        try:
-            print("""Options:\n{"create": "<chat-room-name>"}\n{"join": "<chat-room-name>"}\n{"message": "<message-content>"}
-            (Upon creating / joining a chat-room the user automatically exists the current chat-room)""")
-            command_input = input("Enter Command: ").strip()
-            if not command_input:
+    """Main CLI loop to handle user commands."""
+    print_menu()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            user_input = input("\nEnter JSON command: ")
+            try:
+                command = json.loads(user_input)
+            except json.JSONDecodeError:
+                print("Invalid JSON format. Try again.")
                 continue
 
-            command = json.loads(command_input)
-
-            # --- Create Chat Room and Join ---
+            ws_url = None
             if "create" in command:
-                room_name = command["create"]
-                # Create the chat room via the POST endpoint
-                create_resp = requests.post(
-                    f"{SERVER_URL}/create-chat-room",
-                    json={"chat_room_name": room_name}
-                )
-                print(f"Create response: {create_resp.json()}")
-
-                # Join the chat room automatically
-                join_resp = requests.get(
-                    f"{SERVER_URL}/join-chat-room",
-                    params={"chat_room_name": room_name}
-                )
-                if join_resp.status_code != 200:
-                    print("Error joining chat room:", join_resp.json())
-                    continue
-                data = join_resp.json()
-                print("Chat History:")
-                for msg in data.get("history", []):
-                    print(msg)
-
-                # Use the WebSocket URL from the response to connect
-                websocket_url = data.get("websocket_url")
-                current_websocket = await websockets.connect(websocket_url)
-                print(f"Connected to chat room '{room_name}' via WebSocket.")
-                asyncio.create_task(receive_messages(current_websocket))
-
-            # --- Join Existing Chat Room ---
+                ws_url = await create_room(session, command)
             elif "join" in command:
-                room_name = command["join"]
-                join_resp = requests.get(
-                    f"{SERVER_URL}/join-chat-room",
-                    params={"chat_room_name": room_name}
-                )
-                if join_resp.status_code != 200:
-                    print("Error joining chat room:", join_resp.json())
-                    continue
-                data = join_resp.json()
-                print("Chat History:")
-                for msg in data.get("history", []):
-                    print(msg)
+                ws_url = await join_room(session, command)
 
-                # Connect using the received WebSocket URL
-                websocket_url = data.get("websocket_url")
-                current_websocket = await websockets.connect(websocket_url)
-                print(f"Connected to chat room '{room_name}' via WebSocket.")
-                asyncio.create_task(receive_messages(current_websocket))
-
-            # --- Send a Message ---
-            elif "message" in command:
-                if current_websocket is None:
-                    print("You are not connected to any chat room. Please join or create one first.")
-                    continue
-                message_content = command["message"]
-                await current_websocket.send(message_content)
-                print(f"Message sent: {message_content}")
-
+            if ws_url:
+                await handle_chat(ws_url, command["username"])
             else:
-                print("Unknown command. Please use 'create', 'join', or 'message'.")
-        except KeyboardInterrupt:
-            print("\nExiting chat client.")
-            break
-        except Exception as e:
-            print(f"An error occurred: {e}")
-
+                print("Invalid command format. Check the menu for correct format.")
 
 if __name__ == "__main__":
     asyncio.run(main())
